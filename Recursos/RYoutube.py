@@ -1,8 +1,9 @@
 import yt_dlp
 import discord
 import asyncio
+from urllib.parse import urlparse, parse_qs
 from discord import FFmpegPCMAudio
-from PlaylistBot import agregar_a_cola, obtener_proxima_cancion, obtener_cola
+from .PlaylistBot import agregar_a_cola, obtener_proxima_cancion, obtener_cola
 
 async def play_next(ctx):
     """Reproduce la siguiente canción en la cola"""
@@ -18,10 +19,22 @@ async def play_next(ctx):
         await ctx.send("🎶 Lista de reproducción finalizada")
 
 def Ysugerencia(query):
-    """Busca una canción en YouTube y devuelve la URL"""
+    """Busca una canción en YouTube y devuelve la URL limpia"""
+    # Limpieza de URLs malformadas
+    if 'youtube.com/watch?v=https://' in query:
+        query = query.split('v=')[-1].split('&')[0]
+        return f"https://www.youtube.com/watch?v={query}"
+    
+    if 'youtube.com/watch?' in query:
+        parsed = urlparse(query)
+        video_id = parse_qs(parsed.query).get('v', [''])[0]
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+    
+    # Búsqueda normal si no es URL
     ydl_opts = {
         'format': 'bestaudio',
-        'default_search': 'ytsearch',
+        'default_search': 'ytsearch1',
         'noplaylist': True,
         'quiet': True,
         'extract_flat': True
@@ -38,104 +51,106 @@ def Ysugerencia(query):
     return None
 
 def obtenerlista(url_lista):
-    """Obtiene todas las canciones de una lista de YouTube"""
+    """Obtiene canciones de una lista de YouTube"""
     ydl_opts = {
         'quiet': True,
         'extract_flat': True,
-        'skip_download': True
+        'skip_download': True,
+        'playlist_items': '1-100'  # Límite de 100 canciones
     }
 
-    canciones = []
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url_lista, download=False)
-            
-            if 'entries' in info:
-                for entry in info['entries']:
-                    if entry:
-                        url = f"https://www.youtube.com/watch?v={entry['id']}"
-                        canciones.append(url)
-                
-                print(f"Lista obtenida con {len(canciones)} canciones")
-                return canciones
+            return [
+                f"https://www.youtube.com/watch?v={entry['id']}"
+                for entry in info.get('entries', [])
+                if entry
+            ]
     except Exception as e:
         print(f"Error al obtener lista: {e}")
-    
-    return []
+        return []
 
 async def playyoutube(ctx, song):
-    """Reproduce una canción desde YouTube"""
+    """Reproduce audio desde YouTube con sanitización de URLs"""
+    # FIX 1: URLs duplicadas (caso crítico)
+    if 'watch?v=https://' in song:
+        song = song.split('v=')[-1].split('&')[0]
+        song = f"https://www.youtube.com/watch?v={song}"
+    
+    # FIX 2: URLs con parámetros extra
+    elif 'youtube.com/watch?' in song:
+        parsed = urlparse(song)
+        video_id = parse_qs(parsed.query).get('v', [''])[0]
+        if video_id:
+            song = f"https://www.youtube.com/watch?v={video_id}"
+    
     voice_client = ctx.guild.voice_client
     
     ydl_opts = {
         'format': 'bestaudio/best',
         'quiet': True,
-        'default_search': 'ytsearch',
         'source_address': '0.0.0.0',
-        'noplaylist': True
+        'noplaylist': True,
+        'extract_flat': False
     }
 
-    ffmpeg_options = {
-        'options': '-vn',
-        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+    ffmpeg_opts = {
+        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+        'options': '-vn'
     }
 
     try:
-        # Verificar si es una URL de lista
+        # Manejo de listas
         if 'list=' in song:
             canciones = obtenerlista(song)
             if canciones:
                 for cancion in canciones:
                     agregar_a_cola(cancion)
-                
-                await ctx.send(f"🎵 Playlist agregada: {len(canciones)} canciones")
+                await ctx.send(f"🎵 Playlist agregada ({len(canciones)} canciones)")
                 if not voice_client.is_playing():
                     await play_next(ctx)
                 return
             else:
-                await ctx.send("❌ No se pudo obtener la lista de reproducción")
+                await ctx.send("❌ No se pudo obtener la lista")
                 return
 
         # Procesar canción individual
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(song, download=False)
             
-            # Manejar resultados de búsqueda
-            if 'entries' in info:
+            if 'entries' in info:  # Resultado de búsqueda
                 info = info['entries'][0]
             
             if not info:
-                await ctx.send("❌ No se encontró la canción")
+                await ctx.send("❌ Video no encontrado")
                 return
 
-            url = info['url']
-            title = info.get('title', 'Canción desconocida')
-            duration = info.get('duration', 0)
-
-            # Configurar fuente de audio
-            audio_source = discord.FFmpegPCMAudio(
-                source=url,
-                **ffmpeg_options
+            audio_source = FFmpegPCMAudio(
+                source=info['url'],
+                **ffmpeg_opts
             )
 
-            # Reproducir o encolar
+            def after_playing(error):
+                if error:
+                    print(f"Error after_playing: {error}")
+                asyncio.run_coroutine_threadsafe(play_next(ctx), voice_client.loop)
+
             if voice_client.is_playing() or voice_client.is_paused():
                 agregar_a_cola(song)
-                await ctx.send(f"🎶 Añadido a la cola: **{title}** ({duration}s)")
+                await ctx.send(f"🎶 Añadido a cola: {info.get('title', '?')}")
             else:
-                def after_playing(error):
-                    coro = play_next(ctx)
-                    fut = asyncio.run_coroutine_threadsafe(coro, voice_client.loop)
-                    try:
-                        fut.result()
-                    except:
-                        pass
-
                 voice_client.play(audio_source, after=after_playing)
-                await ctx.send(f"🎵 Reproduciendo: **{title}** ({duration}s)")
+                await ctx.send(f"🎵 Reproduciendo: {info.get('title', '?')}")
 
+    except yt_dlp.DownloadError as e:
+        await ctx.send("❌ Error al descargar (¿URL válida?)")
+        print(f"DownloadError: {e}")
+    except discord.ClientException as e:
+        await ctx.send("❌ Error de conexión con Discord")
+        print(f"ClientException: {e}")
     except Exception as e:
-        print(f"Error en reproducción: {str(e)}")
-        await ctx.send("❌ Error al procesar la canción")
+        await ctx.send("❌ Error inesperado")
+        print(f"Error en playyoutube: {e}")
         if voice_client.is_connected():
             await play_next(ctx)
