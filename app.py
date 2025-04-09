@@ -6,8 +6,10 @@ from Comandos.Play import setup_music_commands
 
 # Cargar variables de entorno
 load_dotenv()
-TOKEN = os.getenv('token_discord')
-
+TOKEN = os.getenv('DISCORD_TOKEN')
+if not TOKEN:
+    raise ValueError
+    "El token de Discord no está configurado. Asegúrate de tener un archivo .env con DISCORD_TOKEN."
 # Configuración de intents
 intents = discord.Intents.default()
 intents.message_content = True
